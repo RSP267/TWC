@@ -1,6 +1,6 @@
 
 """
-<plugin key="TWC" name="Tesla Wall Connector Plugin" author="RSP267" version="1.0.0" externallink="https://github.com/RSP267/Domoticz-TWC">
+<plugin key="TWC" name="Tesla Wall Connector Plugin" author="RSP267" version="1.0.0" externallink="https://github.com/RSP267/TWC">
     <params>
         <param field="SerialPort" label="Serial Port" width="300px" required="true" default=""/>
         <param field="Mode1" label="Max network current" width="50px" default="25"/>
