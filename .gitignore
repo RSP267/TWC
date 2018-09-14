@@ -1,0 +1,7 @@
+
+deploy.sh
+test.sh
+todo.txt
+test.py
+*.pyc
+*.log
