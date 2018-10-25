@@ -5,3 +5,4 @@ todo.txt
 test.py
 *.pyc
 *.log
+.vscode/

@@ -11,6 +11,7 @@ import binascii
 # Consts
 INCAMPSDELAY = 60           # delay before a twc can increase current
 DECAMPSDELAY = 0            # delay before a twc can decrease current
+STARTCHARGETIME = 5         # delay 5 seconds after start charging
 TIMETOSAVEMODE = 10         # time before going to save mode when no actual total power has been received
 TIMETODELTWC = 30           # time before TWC is removed from list when it does not send heartbeats
 MSGSLEEP = 0.1              # wait 100ms after sending a message for slave te respond, preventing message collisions
@@ -104,7 +105,7 @@ class TWC:
     def setKwhVoltsFromTWC(self, kwh, volts):
         # clear calculatedWatts when kwh changed
         if (kwh != self.totalKwh):
-            self.caclulatedWatts = 0.0
+            self.calculatedWatts = 0.0
         self.totalKwh = kwh
         self.volts = volts
 
@@ -112,9 +113,9 @@ class TWC:
     def isActive(self):
         return (self.state not in {TWC.NONE, TWC.DONOTCHARGE, TWC.READYTOCHARGE}) or (self.actualAmps > 0.5)
 
-    # dead when the slave is not sending heartbeats
+    # dead when the slave is not sending heartbeats and charging not stopped
     def isDead(self):
-        return (self.lastDataChanged < time.time() - TIMETODELTWC)
+        return (self.lastDataChanged < time.time() - TIMETODELTWC) and (self.setAmps > 0)
 
     # get the kwh/volts from twc every minute
     def getKwhVoltsMsg(self):
@@ -151,7 +152,7 @@ class TWC:
                 self.setAmps = 0
 
         # delay 5 seconds after start charging
-        if ((self.availableAmps > 0) and (time.time() < self.startChargingTime + 5)):
+        if ((self.availableAmps > 0) and (time.time() < self.startChargingTime + STARTCHARGETIME)):
             # don't change charge current setting
             self.setAmps = self.availableAmps
 
@@ -189,20 +190,25 @@ class TWC:
 
     # Heartbeat message for version 2 twc
     def createHeartBeatMsg2(self):
+        # twc version 2 can't stop charging, set charge to minimum, and stop communication
+        if (self.setAmps == 0):
+            if (self.availableAmps > TWCMINAMPS):
+                logging.info("TWC(%04x) can not stop charging, set to minimal amps: %.2f and stop communication", self.twcId, TWCMINAMPS)
+                self.setAmps = TWCMINAMPS
+            else:
+                # stop sending heartbeats to stop charging
+                self.availableAmps = 0.0
+                self.actualAmps = 0.0
+                self.actualPower = 0.0
+                return None
+
         # heartbeat msg = FBE0 mastedid slaveid 09/05 amps*100
         msg = bytearray([0xfb, 0xe0, (masterTWCId>>8) & 0xFF, masterTWCId & 0xFF, (self.twcId>>8) & 0xFF, self.twcId & 0xFF])
-
-        # twc version 2 uses 0x09 for changing current and 0x05 for set charge current (when not charging?)
-        cmd = 0x09
-        if not self.isActive():
-            cmd = 0x05
-
-        if (self.setAmps == 0):
-            # twc version 2 can't stop charging, set charge to minimum
-            logging.info("TWC(%04x) can not stop charging, set to minimal amps: %.2f", self.twcId, TWCMINAMPS)
-            self.setAmps = TWCMINAMPS
-
         if (self.availableAmps != self.setAmps):
+            # twc version 2 uses 0x09 for changing current and 0x05 for set charge current (when not charging?)
+            cmd = 0x09
+            if not self.isActive():
+                cmd = 0x05
             # set new max charge amps
             hundredthsOfAmps = int(self.setAmps * 100)
             msg.extend(bytearray([cmd, (hundredthsOfAmps >> 8) & 0xFF, hundredthsOfAmps & 0xFF, 0x00,0x00,0x00,0x00,0x00,0x00]))
@@ -478,6 +484,9 @@ def recvMsg():
     if start < 0:
         return None
     end = dataIn.find(b"\xc0", start + 1)
+    if (end-start == 1):
+        start = end
+        end = dataIn.find(b"\xc0", start + 1)
     if end < 0:
         return None
     # discard data until start
@@ -633,9 +642,11 @@ def speedup4Testing():
     global TIMETODELTWC
     global MSGSLEEP
     global otherAmpsHistMaxCount
+    global STARTCHARGETIME
     INCAMPSDELAY = 0
     DECAMPSDELAY = 0
     TIMETOSAVEMODE = 5
     TIMETODELTWC = 5
     MSGSLEEP = 0.1
     otherAmpsHistMaxCount = 1
+    STARTCHARGETIME = 0
