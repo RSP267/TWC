@@ -227,7 +227,7 @@ def setConfig(totalmax, twctotal, twc, level, file):
     global TotalMaxAmps
     global TWCsTotalMaxAmps
     global TWCMaxAmps
-    global loglevel
+    global LogLevel
     global LogFile
     TotalMaxAmps = totalmax
     TWCsTotalMaxAmps = min(twctotal, TotalMaxAmps)
@@ -502,6 +502,8 @@ def recvMsg():
 
 # handle message reveived from slave
 def handleRecvMsg(msg):
+    global initialized
+    
     msglen = len(msg)
     if msglen < 14:
         if msglen > 1:
