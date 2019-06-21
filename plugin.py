@@ -21,10 +21,15 @@ import Domoticz
 import twcmaster
 import logging
 import binascii
+import statistics
 
 # RS485 connection
 SerialConn = None
 loglevel = logging.INFO
+
+# last network current for average of last 10 seconds
+networkCurrentList = []
+networkCurrentCount = 10
 
 # start plugin: set config, devices en connect serial connection
 def onStart():
@@ -88,27 +93,37 @@ def onMessage(Connection, Data):
     for b in range(len(Data)):
         msg.append(Data[b])
     if (loglevel == logging.DEBUG):
-        Domoticz.Log("onMessage: " + str(binascii.hexlify(msg)))
+        Domoticz.Log("Recv:" + str(binascii.hexlify(msg)))
     twcmaster.dataReceived(msg)
 
 # commend from domitics
 # device "TWC - Network current" -> set total current in use and the voltage(s)
 # device "TWC - Total charge" -> set scheduled max current
 def onCommand(Unit, Command, Level, Hue):
+    global networkCurrent
     Domoticz.Log("onCommand called for Unit " + str(Unit) + ": Parameter '" + str(Command) + "', Level: " + str(Level))
     if (Unit == 1):
-        # command = amps;v1;v2;v3
+        # command = p1;p2;p3;v1;v2;v3
         values = Command.split(";")
-        power = float(values.pop(0))
+        power = []
+        power.append(float(values.pop(0)))
+        power.append(float(values.pop(0)))
+        power.append(float(values.pop(0)))
         volts = []
-        for val in values:
-            volts.append(float(val))
+        volts.append(float(values.pop(0)))
+        volts.append(float(values.pop(0)))
+        volts.append(float(values.pop(0)))
 
         # set actual volts first, setting total amps will trigger the calculations
         twcmaster.setActualVolts(volts)
-        twcmaster.setActualTotalPower(power)
+        twcmaster.setActualPower(power)
+
+        # set network current device value
         if (1 in Devices):
-            Devices[1].Update(nValue=0, sValue=str(round(twcmaster.getTotalAmps(), 2)))
+            networkCurrentList.append(twcmaster.getTotalAmps())
+            if len(networkCurrentList) > networkCurrentCount:
+                networkCurrentList.pop(0)
+            Devices[1].Update(nValue=0, sValue=str(round(statistics.mean(networkCurrentList), 2)))
     if (Unit == 2):
         # set max charge current
         amps = float(Command)
@@ -134,8 +149,8 @@ def onHeartbeat():
     for twcid, power in sorted(twcpow.items()):
         kwh = twckwh[twcid]
         twcPowerValues.append(str(round(power, 0)) + ";" + str(round(kwh * 1000, 0)))
-    for i in range(len(twcPowerValues), 3):
-        twcPowerValues.append("null;null")
+    for _ in range(len(twcPowerValues), 3):
+        twcPowerValues.append("0;0")
 
     # update devices
     if (2 in Devices):
@@ -146,13 +161,19 @@ def onHeartbeat():
         setDeviceValues(Devices[4], twcmaster.getTWCsActualAmps().items(), 3, 2)
     if (5 in Devices):
         setDeviceValues(Devices[5], twcmaster.getTWCsSetAmps().items(), 3, 2)
-    if (11 in Devices):
+  
+    if ((11 in Devices) and (twcPowerValues[0] != "0;0")):
         Devices[11].Update(nValue=0, sValue=twcPowerValues[0])
-    if (12 in Devices):
+    if ((12 in Devices) and (twcPowerValues[1] != "0;0")):
         Devices[12].Update(nValue=0, sValue=twcPowerValues[1])
-    if (13 in Devices):
+    if ((13 in Devices) and (twcPowerValues[2] != "0;0")):
         Devices[13].Update(nValue=0, sValue=twcPowerValues[2])
 
+    # reconnect?
+    if (SerialConn):
+        if (not SerialConn.Connected()):
+            Domoticz.Log("Reconnect serial port")
+            SerialConn.Connect()
 
 '''
 Generic helper functions
@@ -168,9 +189,9 @@ def sendData(data):
 # set current device values
 def setDeviceValues(device, values, count, decimals):
     s = ""
-    for k, v in sorted(values):
+    for _, v in sorted(values):
         s = s + str(round(v, decimals)) + ";"
-    for i in range(len(values), count):
+    for _ in range(len(values), count):
         s = s + "null;"
     s = s.rstrip(';')
     device.Update(nValue=0, sValue=s)

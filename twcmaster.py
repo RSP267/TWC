@@ -14,7 +14,7 @@ DECAMPSDELAY = 0            # delay before a twc can decrease current
 STARTCHARGETIME = 5         # delay 5 seconds after start charging
 TIMETOSAVEMODE = 10         # time before going to save mode when no actual total power has been received
 TIMETODELTWC = 30           # time before TWC is removed from list when it does not send heartbeats
-MSGSLEEP = 0.1              # wait 100ms after sending a message for slave te respond, preventing message collisions
+MSGSLEEP = 0.15             # wait after sending a message for slave to respond, preventing message collisions
 MAXSLAVES = 3               # max number of slaves
 TWCMINAMPS = 6.0            # min current needed for charging
 
@@ -29,13 +29,13 @@ masterTWCId = 0x8888        # TWC id of this master
 masterTWCSign = 0x88        # Sign of this master
 twcList = []                # TWC slaves
 dataIn = bytearray([])      # data received from serial interface
-sendDataCallback = None     # callback function for sendind data to serial interface
+sendDataCallback = None     # callback function for sending data to serial interface
 otherAmpsHistList = []      # history list with amps in use by other devices
 otherAmpsHistMaxCount = 60  # max size of history list ~ 1 minute
 
 # Input vars
 scheduledMaxAmps = 99.0     # total max current for all TWCs set by schedule
-actualTotalPower = 0.0      # actual total power in use by all devices including TWCs
+actualTotalPower = [0.0]    # actual total power per phase in use by all devices including TWCs
 actualTolalPowerChanged = time.time()
 actualVolts = [230]         # actual volts per phase, used for calculating amps - power
 
@@ -62,6 +62,7 @@ class TWC:
     INCCHARGE = 6
     DECCHARGE = 7
     STARTCHARGING = 8
+    CHANGECHARGE = 9
 
     # on init set data received from slave linkready msg
     def __init__(self, twcId, maxAmps, version):
@@ -70,6 +71,9 @@ class TWC:
         self.twcVersion = version
         self.state = TWC.NONE
         self.maxAmps = maxAmps
+        self.startAmps = 16.0
+        if (maxAmps >= 80):
+            self.startAmps = 21.0
         self.availableAmps = 0.0
         self.actualAmps = 0.0
         self.lastDataChanged = time.time()
@@ -117,14 +121,6 @@ class TWC:
     def isDead(self):
         return (self.lastDataChanged < time.time() - TIMETODELTWC) and (self.setAmps > 0)
 
-    # get the kwh/volts from twc every minute
-    def getKwhVoltsMsg(self):
-        # only for TWC verion 2 and once per minute
-        if ((self.twcVersion == 2) and (self.lastKwhVoltsRequested < time.time() - 60)):
-            self.lastKwhVoltsRequested = time.time()
-            return bytearray([0xfb, 0xeb, (masterTWCId>>8) & 0xFF, masterTWCId & 0xFF, (self.twcId>>8) & 0xFF, self.twcId & 0xFF, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00])
-        return None
-
     # get heartbeat msg to send
     def getHeartBeatMsg(self):
         # never use more current TWC or wiring can handle
@@ -138,31 +134,40 @@ class TWC:
                 self.desiredAmps = 0
             else:
                 # start charging with 21A in US and 16A in EU for 5 seconds
-                if (self.maxAmps >= 80):
-                    self.desiredAmps = 21
-                else:
-                    self.desiredAmps = 16
+                self.desiredAmps = self.startAmps
 
-        # set max amps for TWC when desired is lower or after INCAMPSDELAY sec when current increases
-        if (((self.desiredAmps <= self.availableAmps) and (self.lastAmpsChanged < time.time() - DECAMPSDELAY))
+        # set amps for TWC when desired is lower or after INCAMPSDELAY sec when current increases
+        if (((self.desiredAmps < self.availableAmps) and (self.lastAmpsChanged < time.time() - DECAMPSDELAY))
                 or (self.lastAmpsChanged < time.time() - INCAMPSDELAY)):
-            self.setAmps = self.desiredAmps
-            if (self.setAmps < TWCMINAMPS):
-                # stop charging
+            # stop charging when disered < min  
+            if (self.desiredAmps < TWCMINAMPS):
                 self.setAmps = 0
-
+            else:
+                # set charge value
+                if (self.isActive()):
+                    diff = self.desiredAmps - self.actualAmps
+                    if (diff > 3):
+                        # increase current with 50% will prevent fluctuation in charge setting
+                        self.desiredAmps = max(math.trunc(self.actualAmps + (diff / 2)), TWCMINAMPS)
+                    if ((self.availableAmps == self.desiredAmps) and (self.actualAmps > 4.0) and (self.desiredAmps - self.actualAmps > 1.5)):
+                        # stuck in charge setting: changing the setting will reset this
+                        logging.info("TWC(%04x) reset charge setting")
+                        self.desiredAmps = max (self.desiredAmps - 1, TWCMINAMPS)
+                        # TODO or: self.desiredAmps = max (math.trunc(self.actualAmps), TWCMINAMPS) -- werkt dit met preconditioning?
+                self.setAmps = self.desiredAmps
+           
         # delay 5 seconds after start charging
         if ((self.availableAmps > 0) and (time.time() < self.startChargingTime + STARTCHARGETIME)):
-            # don't change charge current setting
-            self.setAmps = self.availableAmps
+            self.setAmps = self.startAmps
 
         # start charging?
-        if ((self.setAmps > 0) and (self.availableAmps == 0)):
+        if ((self.state != TWC.NONE) and (self.setAmps > 0) and (self.availableAmps == 0)):
+            self.setAmps = self.startAmps
             logging.info("TWC(%04x) START charging %.2f", self.twcId, self.setAmps)
             self.startChargingTime = time.time()
 
         # stop charging?
-        if ((self.setAmps == 0) and (self.availableAmps > 0)):
+        if ((self.state != TWC.NONE) and (self.setAmps == 0) and (self.availableAmps > 0)):
             logging.info("TWC(%04x) STOP charging", self.twcId)
 
         if (self.twcVersion == 1):
@@ -176,7 +181,7 @@ class TWC:
         msg = bytearray([0xfb, 0xe0, (masterTWCId>>8) & 0xFF, masterTWCId & 0xFF, (self.twcId>>8) & 0xFF, self.twcId & 0xFF])
 
         # set new max amps or stop charging when setAmps = 0
-        if ((self.availableAmps != self.setAmps) or (self.setAmps == 0)):
+        if ((self.state != TWC.NONE) and (self.availableAmps != self.setAmps) or (self.setAmps == 0)):
             hundredthsOfAmps = int(self.setAmps * 100)
             msg.extend(bytearray([0x05, (hundredthsOfAmps >> 8) & 0xFF, hundredthsOfAmps & 0xFF, 0x00,0x00,0x00,0x00]))
             if (self.availableAmps != self.setAmps):
@@ -191,7 +196,7 @@ class TWC:
     # Heartbeat message for version 2 twc
     def createHeartBeatMsg2(self):
         # twc version 2 can't stop charging, set charge to minimum, and stop communication
-        if (self.setAmps == 0):
+        if ((self.state != TWC.NONE) and (self.setAmps == 0)):
             if (self.availableAmps > TWCMINAMPS):
                 logging.info("TWC(%04x) can not stop charging, set to minimal amps: %.2f and stop communication", self.twcId, TWCMINAMPS)
                 self.setAmps = TWCMINAMPS
@@ -204,22 +209,33 @@ class TWC:
 
         # heartbeat msg = FBE0 mastedid slaveid 09/05 amps*100
         msg = bytearray([0xfb, 0xe0, (masterTWCId>>8) & 0xFF, masterTWCId & 0xFF, (self.twcId>>8) & 0xFF, self.twcId & 0xFF])
-        if (self.availableAmps != self.setAmps):
+        # set charge setting when changed or charging and setting != actual
+        if ( (self.state != TWC.NONE) and (self.availableAmps != self.setAmps) ):
             # twc version 2 uses 0x09 for changing current and 0x05 for set charge current (when not charging?)
             cmd = 0x09
-            if not self.isActive():
-                cmd = 0x05
+            #if (self.availableAmps == 0.0):
+            #    cmd = 0x05
             # set new max charge amps
             hundredthsOfAmps = int(self.setAmps * 100)
             msg.extend(bytearray([cmd, (hundredthsOfAmps >> 8) & 0xFF, hundredthsOfAmps & 0xFF, 0x00,0x00,0x00,0x00,0x00,0x00]))
             self.lastAmpsChanged = time.time()
             logging.info("TWC(%04x) set max amps to: %.2f", self.twcId, self.setAmps)
         else:
-            # no change needed
+            # no change needed: request kwh/volts or send no change heartbeat
+            kwhmsg = self.getKwhVoltsMsg()
+            if (kwhmsg):
+                return kwhmsg
             msg.extend(bytearray([0x00,0x00,0x00,0x00,0x00,0x00,0x000,0x00,0x00]))
 
         return msg
 
+    # get the kwh/volts from twc every minute
+    def getKwhVoltsMsg(self):
+        # only for TWC verion 2 and once per minute
+        if ((self.twcVersion == 2) and (self.lastKwhVoltsRequested < time.time() - 60)):           
+            self.lastKwhVoltsRequested = time.time()
+            return bytearray([0xfb, 0xeb, (masterTWCId>>8) & 0xFF, masterTWCId & 0xFF, (self.twcId>>8) & 0xFF, self.twcId & 0xFF, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00])
+        return None
 
 
 # set config parameters
@@ -263,7 +279,7 @@ def setActualVolts(volts):
 
 
 # Actual total power in use, set in powerchange event
-def setActualTotalPower(power):
+def setActualPower(power):
     global actualTotalPower
     global actualTolalPowerChanged
     actualTolalPowerChanged = time.time()
@@ -349,6 +365,12 @@ def calcDesiredAmps():
     global totalChargingAmps
     global twcTotalAvailableAmps
 
+    # use the lowest voltage and highest power to calc amps = power/volt 
+    volt = actualVolts[0]
+    for v in actualVolts:
+        if (v > 0 and v < volt):
+            volt = v
+
     # get Total current and power in use by all wall connectors
     actualTotalTWCsAmps = 0.0
     actualTotalTWCsPower = 0.0
@@ -359,23 +381,11 @@ def calcDesiredAmps():
     # Total amps per phase in use by all twcs
     totalChargingAmps = actualTotalTWCsAmps
 
-    # FOR TEST WITH FAKE SLAVE !!! TODO:
-    global actualTotalPower
-    actualTotalPower += actualTotalTWCsPower
-    # END FOR TEST WITH FAKE SLAVE
-
-    # power in use by other devices
-    actualOtherDevicesPower = max(actualTotalPower - actualTotalTWCsPower, 0)
-
-    # calc current available all TWCs, asume all other devices are on one phase with the lowest voltage = power/volt
-    volt = actualVolts[0]
-    for v in actualVolts:
-        if (v > 0 and v < volt):
-            volt = v
-    actualOtherDevicesAmps = actualOtherDevicesPower / volt
-
-    # total current in use on one phase
-    totalAmps = actualOtherDevicesAmps + totalChargingAmps
+    # max amps in use per phase
+    totalAmps = max(actualTotalPower) / volt
+    
+    # apms in use per phase for other devices
+    actualOtherDevicesAmps = totalAmps - totalChargingAmps
 
     # check if actualTotalPower has been updated the last TIMETOSAVEMODE seconds
     if (actualTolalPowerChanged > time.time() - TIMETOSAVEMODE):
@@ -490,11 +500,11 @@ def recvMsg():
     if end < 0:
         return None
     # discard data until start
-    for i in range(start+1):
+    for _ in range(start+1):
         dataIn.pop(0)
     # pop message
     msg = bytearray([])
-    for i in range(end-start-1):
+    for _ in range(end-start-1):
         msg.append(dataIn.pop(0))
     # return unescaped data
     return unescapeData(msg)
@@ -503,11 +513,11 @@ def recvMsg():
 # handle message reveived from slave
 def handleRecvMsg(msg):
     global initialized
-    
+
     msglen = len(msg)
     if msglen < 14:
         if msglen > 1:
-            logging.warn("recv message to short: %s", binascii.hexlify(msg))
+            logging.debug("recv message to short: %s", binascii.hexlify(msg))
         return
 
     checksum = calcChecksum(msg, 1, msglen - 2)
@@ -523,7 +533,7 @@ def handleRecvMsg(msg):
     if msgtype == 0xfde2:
         # handle linkready from slave
         sender = (msg[2] << 8) + msg[3]
-        sign = msg[4]
+        # sign = msg[4]
         amps = ((msg[5] << 8) + msg[6]) / 100.0
         version = 1 if len(msg) == 14 else 2
         logging.info("Linkready from slave: %04x %.2f", sender, amps)
@@ -587,9 +597,9 @@ def handleRecvMsg(msg):
 def initMaster():
     linkready1 = bytearray([0xfc, 0xe1, (masterTWCId>>8) & 0xFF, masterTWCId & 0xFF, masterTWCSign, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00])
     linkready2 = bytearray([0xfb, 0xe2, (masterTWCId>>8) & 0xFF, masterTWCId & 0xFF, masterTWCSign, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00])
-    for i in range (5):
+    for _ in range (5):
         sendMsg(linkready1)
-    for i in range (5):
+    for _ in range (5):
         sendMsg(linkready2)
 
 
@@ -621,10 +631,6 @@ def update():
     # send heartbeat to slave(s)
     for twc in twcList:
         sendMsg(twc.getHeartBeatMsg())
-
-    # get kwh/Volts from slave(s) (once per minute per twc)
-    for twc in twcList:
-        sendMsg(twc.getKwhVoltsMsg())
 
 
 # call this method every second to do the processing
