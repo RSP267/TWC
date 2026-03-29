@@ -96,7 +96,7 @@ def onMessage(Connection, Data):
         Domoticz.Log("Recv:" + str(binascii.hexlify(msg)))
     twcmaster.dataReceived(msg)
 
-# commend from domitics
+# command from domitics
 # device "TWC - Network current" -> set total current in use and the voltage(s)
 # device "TWC - Total charge" -> set scheduled max current
 def onCommand(Unit, Command, Level, Hue):
@@ -148,7 +148,10 @@ def onHeartbeat():
     twcPowerValues = []
     for twcid, power in sorted(twcpow.items()):
         kwh = twckwh[twcid]
-        twcPowerValues.append(str(round(power, 0)) + ";" + str(round(kwh * 1000, 0)))
+        if (kwh > 0):
+            twcPowerValues.append(str(round(power, 0)) + ";" + str(round(kwh * 1000, 0)))
+        else:
+            twcPowerValues.append("0;0")
     for _ in range(len(twcPowerValues), 3):
         twcPowerValues.append("0;0")
 
@@ -161,7 +164,7 @@ def onHeartbeat():
         setDeviceValues(Devices[4], twcmaster.getTWCsActualAmps().items(), 3, 2)
     if (5 in Devices):
         setDeviceValues(Devices[5], twcmaster.getTWCsSetAmps().items(), 3, 2)
-  
+
     if ((11 in Devices) and (twcPowerValues[0] != "0;0")):
         Devices[11].Update(nValue=0, sValue=twcPowerValues[0])
     if ((12 in Devices) and (twcPowerValues[1] != "0;0")):

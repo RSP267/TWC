@@ -9,12 +9,12 @@ import logging.handlers
 import binascii
 
 # Consts
-INCAMPSDELAY = 60           # delay before a twc can increase current
+INCAMPSDELAY = 10           # delay before a twc can increase current
 DECAMPSDELAY = 0            # delay before a twc can decrease current
 STARTCHARGETIME = 5         # delay 5 seconds after start charging
 TIMETOSAVEMODE = 10         # time before going to save mode when no actual total power has been received
 TIMETODELTWC = 30           # time before TWC is removed from list when it does not send heartbeats
-MSGSLEEP = 0.15             # wait after sending a message for slave to respond, preventing message collisions
+MSGSLEEP = 0.2              # wait after sending a message for slave to respond, preventing message collisions
 MAXSLAVES = 3               # max number of slaves
 TWCMINAMPS = 6.0            # min current needed for charging
 
@@ -128,43 +128,40 @@ class TWC:
 
         # check if charging was stopped
         if (self.setAmps == 0):
-            # start charging when apms >= TWCMINAMPS
+            # only start charging when apms >= TWCMINAMPS
             if (self.desiredAmps < TWCMINAMPS):
                 # do not start charging
                 self.desiredAmps = 0
-            else:
-                # start charging with 21A in US and 16A in EU for 5 seconds
-                self.desiredAmps = self.startAmps
 
-        # set amps for TWC when desired is lower or after INCAMPSDELAY sec when current increases
-        if (((self.desiredAmps < self.availableAmps) and (self.lastAmpsChanged < time.time() - DECAMPSDELAY))
-                or (self.lastAmpsChanged < time.time() - INCAMPSDELAY)):
-            # stop charging when disered < min  
+        # set amps for TWC when desired is lower
+        if ((self.desiredAmps < self.availableAmps) and (self.lastAmpsChanged < time.time() - DECAMPSDELAY)):
+            # stop charging when disered < min
             if (self.desiredAmps < TWCMINAMPS):
                 self.setAmps = 0
             else:
-                # set charge value
-                if (self.isActive()):
-                    diff = self.desiredAmps - self.actualAmps
-                    if (diff > 3):
-                        # increase current with 50% will prevent fluctuation in charge setting
-                        self.desiredAmps = max(math.trunc(self.actualAmps + (diff / 2)), TWCMINAMPS)
-                    if ((self.availableAmps == self.desiredAmps) and (self.actualAmps > 4.0) and (self.desiredAmps - self.actualAmps > 1.5)):
-                        # stuck in charge setting: changing the setting will reset this
-                        logging.info("TWC(%04x) reset charge setting")
-                        self.desiredAmps = max (self.desiredAmps - 1, TWCMINAMPS)
-                        # TODO or: self.desiredAmps = max (math.trunc(self.actualAmps), TWCMINAMPS) -- werkt dit met preconditioning?
                 self.setAmps = self.desiredAmps
-           
-        # delay 5 seconds after start charging
+
+        # set amps when desired is higher and TWC is charging
+        if ((self.desiredAmps > self.availableAmps) and (self.lastAmpsChanged < time.time() - INCAMPSDELAY)
+            and (self.state not in [TWC.CHANGECHARGE])):
+            if (self.isActive()):
+                # charging: increase with 50%, will prevent fluctuation in charge settings
+                diff = self.desiredAmps - self.actualAmps
+                if (diff >= 3):
+                    self.desiredAmps = max(math.trunc(self.actualAmps + ((diff+1)/2)), self.availableAmps)
+                self.setAmps = self.desiredAmps
+            else:
+                # not active set to start amps
+                self.setAmps = min(self.desiredAmps, self.startAmps)
+
+        # delay 5 seconds after charging has started
         if ((self.availableAmps > 0) and (time.time() < self.startChargingTime + STARTCHARGETIME)):
             self.setAmps = self.startAmps
-
         # start charging?
-        if ((self.state != TWC.NONE) and (self.setAmps > 0) and (self.availableAmps == 0)):
+        elif ((self.state != TWC.NONE) and (self.desiredAmps >= TWCMINAMPS) and (self.availableAmps == 0)):
             self.setAmps = self.startAmps
-            logging.info("TWC(%04x) START charging %.2f", self.twcId, self.setAmps)
             self.startChargingTime = time.time()
+            logging.info("TWC(%04x) START charging %.2f", self.twcId, self.setAmps)
 
         # stop charging?
         if ((self.state != TWC.NONE) and (self.setAmps == 0) and (self.availableAmps > 0)):
@@ -210,11 +207,9 @@ class TWC:
         # heartbeat msg = FBE0 mastedid slaveid 09/05 amps*100
         msg = bytearray([0xfb, 0xe0, (masterTWCId>>8) & 0xFF, masterTWCId & 0xFF, (self.twcId>>8) & 0xFF, self.twcId & 0xFF])
         # set charge setting when changed or charging and setting != actual
-        if ( (self.state != TWC.NONE) and (self.availableAmps != self.setAmps) ):
-            # twc version 2 uses 0x09 for changing current and 0x05 for set charge current (when not charging?)
+        if ((self.state != TWC.NONE) and (self.availableAmps != self.setAmps)):
+            # twc version 2 uses 0x09 for changing current
             cmd = 0x09
-            #if (self.availableAmps == 0.0):
-            #    cmd = 0x05
             # set new max charge amps
             hundredthsOfAmps = int(self.setAmps * 100)
             msg.extend(bytearray([cmd, (hundredthsOfAmps >> 8) & 0xFF, hundredthsOfAmps & 0xFF, 0x00,0x00,0x00,0x00,0x00,0x00]))
@@ -232,7 +227,7 @@ class TWC:
     # get the kwh/volts from twc every minute
     def getKwhVoltsMsg(self):
         # only for TWC verion 2 and once per minute
-        if ((self.twcVersion == 2) and (self.lastKwhVoltsRequested < time.time() - 60)):           
+        if ((self.twcVersion == 2) and (self.lastKwhVoltsRequested < time.time() - 60)):
             self.lastKwhVoltsRequested = time.time()
             return bytearray([0xfb, 0xeb, (masterTWCId>>8) & 0xFF, masterTWCId & 0xFF, (self.twcId>>8) & 0xFF, self.twcId & 0xFF, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00])
         return None
@@ -272,7 +267,7 @@ def setScheduledMaxAmps(amps):
         logging.info("ScheduledMaxAmps changed to: %.2f", amps)
 
 
-# set actuel volts from power supply, used for calculating twc power
+# set actual volts from power supply, used for calculating twc power
 def setActualVolts(volts):
     global actualVolts
     actualVolts = volts
@@ -365,7 +360,7 @@ def calcDesiredAmps():
     global totalChargingAmps
     global twcTotalAvailableAmps
 
-    # use the lowest voltage and highest power to calc amps = power/volt 
+    # use the lowest voltage and highest power to calc amps = power/volt
     volt = actualVolts[0]
     for v in actualVolts:
         if (v > 0 and v < volt):
@@ -375,7 +370,7 @@ def calcDesiredAmps():
     actualTotalTWCsAmps = 0.0
     actualTotalTWCsPower = 0.0
     for twc in twcList:
-        actualTotalTWCsAmps +=  twc.actualAmps
+        actualTotalTWCsAmps += twc.actualAmps
         actualTotalTWCsPower += twc.actualPower
 
     # Total amps per phase in use by all twcs
@@ -383,7 +378,7 @@ def calcDesiredAmps():
 
     # max amps in use per phase
     totalAmps = max(actualTotalPower) / volt
-    
+
     # apms in use per phase for other devices
     actualOtherDevicesAmps = totalAmps - totalChargingAmps
 
